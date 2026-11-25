@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid36816",
+  "B": "/home/dev/feedback/uid36816",
+  "sha": "7217f132daaf9b75efd52f414c0a468192581b46",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "cert-manager",
+    "repo": "cert-manager",
+    "sha": "7217f132daaf9b75efd52f414c0a468192581b46"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "cert-manager",
+    "cloneUrl": "https://github.com/Rrr119/cert-manager.git"
+  },
+  "at": "2026-11-25T02:40:17.565Z"
+}

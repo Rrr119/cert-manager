@@ -551,6 +551,18 @@ func (a *Acme) registerAccount(ctx context.Context, cl client.Interface, acmeEma
 		return cl.GetReg(ctx, "")
 	}
 	if err != nil {
+		// Some CAs reject a new-account request when the account key is already
+		// registered instead of returning HTTP 200 with the existing account.
+		// This is especially common with CAs that require EAB for new
+		// registrations: a duplicate registration can be rejected with an EAB
+		// error even though a lookup with the account key succeeds.
+		//
+		// Registration errors are retried by the caller, so only fall back to a
+		// lookup after a failed registration. If no account exists, return the
+		// original registration error so genuine EAB failures remain visible.
+		if existing, lookupErr := cl.GetReg(ctx, ""); lookupErr == nil && existing != nil {
+			return existing, nil
+		}
 		return nil, err
 	}
 	// TODO: re-enable this check once this field is set by Pebble
@@ -576,17 +588,24 @@ func (a *Acme) getEABKey(ctx context.Context, ns string, eab cmmeta.SecretKeySel
 	if !ok {
 		return nil, cmerrors.NewInvalidData("failed to find external account binding key data in Secret %q at index %q", eab.Name, eab.Key)
 	}
+	if len(encodedKeyData) == 0 {
+		return nil, cmerrors.NewInvalidData("external account binding key data in Secret %q at index %q is empty", eab.Name, eab.Key)
+	}
 
 	// decode the base64 encoded secret key data.
 	// we include this step to make it easier for end-users to encode secret
 	// keys in case the CA provides a key that is not in standard, padded
 	// base64 encoding.
 	keyData := make([]byte, base64.RawURLEncoding.DecodedLen(len(encodedKeyData)))
-	if _, err := base64.RawURLEncoding.Decode(keyData, encodedKeyData); err != nil {
+	n, err := base64.RawURLEncoding.Decode(keyData, encodedKeyData)
+	if err != nil {
 		return nil, cmerrors.NewInvalidData("failed to decode external account binding key data: %v", err)
 	}
+	if n == 0 {
+		return nil, cmerrors.NewInvalidData("external account binding key data in Secret %q at index %q is empty", eab.Name, eab.Key)
+	}
 
-	return keyData, nil
+	return keyData[:n], nil
 }
 
 // createAccountPrivateKey will generate a new RSA private key, and create it

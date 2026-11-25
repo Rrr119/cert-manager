@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/rsa"
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"slices"
@@ -95,6 +96,15 @@ func TestAcme_Setup(t *testing.T) {
 			StatusCode:  400,
 			ProblemType: "urn:ietf:params:acme:error:invalidEmail",
 			Detail:      "contact email has an invalid domain: empty label",
+		}
+
+		// eabProcessErr models a CA which rejects a new-account request for an
+		// account key that is already registered. DigiCert returns this when EAB
+		// is required for new registrations only.
+		eabProcessErr = &acmeapi.Error{
+			StatusCode:  400,
+			ProblemType: "urn:ietf:params:acme:error:eabProcessError",
+			Detail:      "EAB request error.",
 		}
 
 		// reflectedBodyACMEErr models a response from an endpoint which is not an
@@ -440,6 +450,70 @@ func TestAcme_Setup(t *testing.T) {
 					gen.SetIssuerConditionMessage(messageAccountRegistered)),
 			},
 		},
+		"ACME account with EAB already exists, Register is rejected and lookup succeeds": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEAB(someString, someString)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			addClientShouldBeCalled:    true,
+			eabSecret:                  eabSecret,
+			registerErr:                eabProcessErr,
+			getRegAcc: &acmeapi.Account{
+				URI:     "https://example.com/acme/acct/123",
+				Contact: []string{someEmailURL},
+			},
+			expectedRegisteredAcc: &acmeapi.Account{
+				ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+					KID: someString,
+					Key: []byte(eabKey),
+				},
+			},
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionTrue),
+					gen.SetIssuerConditionReason(successAccountRegistered),
+					gen.SetIssuerConditionMessage(messageAccountRegistered)),
+			},
+		},
+		"pre-existing ACME account without EAB is recovered when Register is rejected": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEDisableAccountKeyGeneration(true)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			addClientShouldBeCalled:    true,
+			registerErr:                eabProcessErr,
+			getRegAcc: &acmeapi.Account{
+				URI: "https://example.com/acme/acct/123",
+			},
+			expectedRegisteredAcc: &acmeapi.Account{},
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionTrue),
+					gen.SetIssuerConditionReason(successAccountRegistered),
+					gen.SetIssuerConditionMessage(messageAccountRegistered)),
+			},
+		},
+		"ACME account Register is rejected, lookup finds no account and original error is returned": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEAB(someString, someString)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			eabSecret:                  eabSecret,
+			registerErr:                eabProcessErr,
+			getRegErr:                  acmeapi.ErrNoAccount,
+			expectedRegisteredAcc: &acmeapi.Account{
+				ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+					KID: someString,
+					Key: []byte(eabKey),
+				},
+			},
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionFalse),
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+eabProcessErr.Error())),
+			},
+		},
 		"ACME account with legacy EAB key algorithm set and with an email is registered successfully": {
 			issuer: gen.IssuerFrom(baseIssuer,
 				gen.SetIssuerACMEEmail(someEmail),
@@ -748,6 +822,208 @@ func keyFromSecretMockBuilder(wasCalled *bool, key crypto.Signer, err error) key
 func clientBuilderMock(cl acmecl.Interface) accounts.NewClientFunc {
 	return func(_ accounts.NewClientOptions) acmecl.Interface {
 		return cl
+	}
+}
+
+func TestAcme_GetEABKey(t *testing.T) {
+	const namespace = "testns"
+
+	tests := map[string]struct {
+		secret     *corev1.Secret
+		secretErr  error
+		selector   cmmeta.SecretKeySelector
+		wantKey    []byte
+		wantErr    string
+		invalidKey bool
+	}{
+		"valid base64url key": {
+			secret: gen.Secret("eab",
+				gen.SetSecretNamespace(namespace),
+				gen.SetSecretData(map[string][]byte{
+					"key": []byte(base64.RawURLEncoding.EncodeToString([]byte("an-eab-hmac-key"))),
+				})),
+			selector: cmmeta.SecretKeySelector{
+				LocalObjectReference: cmmeta.LocalObjectReference{Name: "eab"},
+				Key:                  "key",
+			},
+			wantKey: []byte("an-eab-hmac-key"),
+		},
+		"missing secret is returned as a not found error": {
+			secretErr: apierrors.NewNotFound(corev1.Resource("secrets"), "eab"),
+			selector: cmmeta.SecretKeySelector{
+				LocalObjectReference: cmmeta.LocalObjectReference{Name: "eab"},
+				Key:                  "key",
+			},
+			wantErr: apierrors.NewNotFound(corev1.Resource("secrets"), "eab").Error(),
+		},
+		"other secret lookup errors are wrapped": {
+			secretErr: fmt.Errorf("apiserver unavailable"),
+			selector: cmmeta.SecretKeySelector{
+				LocalObjectReference: cmmeta.LocalObjectReference{Name: "eab"},
+				Key:                  "key",
+			},
+			wantErr: fmt.Sprintf(messageTemplateFailedToGetEABKey, fmt.Errorf("apiserver unavailable")),
+		},
+		"missing key in secret is invalid data": {
+			secret: gen.Secret("eab",
+				gen.SetSecretNamespace(namespace),
+				gen.SetSecretData(map[string][]byte{
+					"another-key": []byte("value"),
+				})),
+			selector: cmmeta.SecretKeySelector{
+				LocalObjectReference: cmmeta.LocalObjectReference{Name: "eab"},
+				Key:                  "key",
+			},
+			invalidKey: true,
+		},
+		"empty key is invalid data": {
+			secret: gen.Secret("eab",
+				gen.SetSecretNamespace(namespace),
+				gen.SetSecretData(map[string][]byte{
+					"key": {},
+				})),
+			selector: cmmeta.SecretKeySelector{
+				LocalObjectReference: cmmeta.LocalObjectReference{Name: "eab"},
+				Key:                  "key",
+			},
+			invalidKey: true,
+		},
+		"non base64url key is invalid data": {
+			secret: gen.Secret("eab",
+				gen.SetSecretNamespace(namespace),
+				gen.SetSecretData(map[string][]byte{
+					"key": []byte("not/a/base64url+value="),
+				})),
+			selector: cmmeta.SecretKeySelector{
+				LocalObjectReference: cmmeta.LocalObjectReference{Name: "eab"},
+				Key:                  "key",
+			},
+			invalidKey: true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			secretsClient := coreclients.NewFakeSecretsGetterFrom(
+				coreclients.NewFakeSecretsGetter(),
+				coreclients.SetFakeSecretsGetterGet(test.secret, test.secretErr),
+			)
+			a := Acme{secretsClient: secretsClient}
+
+			gotKey, err := a.getEABKey(t.Context(), namespace, test.selector)
+			switch {
+			case test.invalidKey:
+				if !errors.IsInvalidData(err) {
+					t.Fatalf("expected invalid data error, got %v", err)
+				}
+			case test.wantErr != "":
+				if err == nil || err.Error() != test.wantErr {
+					t.Fatalf("expected error %q, got %v", test.wantErr, err)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if !slices.Equal(gotKey, test.wantKey) {
+					t.Fatalf("expected key %q, got %q", test.wantKey, gotKey)
+				}
+			}
+		})
+	}
+}
+
+func TestAcme_SetupBindsEABPerIssuer(t *testing.T) {
+	rsaPrivKey := mustGenerateRSAKey(t)
+
+	type issuerFixture struct {
+		name      string
+		namespace string
+		keyID     string
+		key       string
+	}
+	fixtures := []issuerFixture{
+		{name: "issuer-one", namespace: "ns-one", keyID: "kid-one", key: "key-one"},
+		{name: "issuer-two", namespace: "ns-two", keyID: "kid-two", key: "key-two"},
+		{name: "issuer-three", namespace: "ns-three", keyID: "kid-three", key: "key-three"},
+	}
+
+	registeredUIDs := map[string]string{}
+	accountRegistry := &fakeregistry.FakeRegistry{
+		RemoveClientFunc: func(string) {},
+		AddClientFunc: func(uid string, _ accounts.NewClientOptions) {
+			registeredUIDs[uid] = uid
+		},
+		IsKeyCheckSumCachedFunc: func(string, *rsa.PrivateKey) bool { return true },
+	}
+
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			issuer := gen.Issuer(fixture.name,
+				gen.SetIssuerNamespace(fixture.namespace),
+				gen.SetIssuerACMEURL(acmev2Prod),
+				gen.SetIssuerACMEPrivKeyRef("account-key"),
+				gen.SetIssuerACMEEAB(fixture.keyID, "eab-key"),
+			)
+			issuer.UID = types.UID(fixture.name + "-uid")
+
+			eabSecret := gen.Secret("eab-key",
+				gen.SetSecretNamespace(fixture.namespace),
+				gen.SetSecretData(map[string][]byte{
+					"key": []byte(base64.RawURLEncoding.EncodeToString([]byte(fixture.key))),
+				}),
+			)
+			secretsClient := coreclients.NewFakeSecretsGetterFrom(
+				coreclients.NewFakeSecretsGetter(),
+				coreclients.SetFakeSecretsGetterGet(eabSecret, nil),
+			)
+
+			var gotAccount *acmeapi.Account
+			cl := &acmecl.FakeACME{
+				FakeRegister: func(_ context.Context, account *acmeapi.Account, _ func(string) bool) (*acmeapi.Account, error) {
+					gotAccount = account
+					return &acmeapi.Account{
+						URI:                    "https://acme.example.com/account/" + fixture.keyID,
+						ExternalAccountBinding: account.ExternalAccountBinding,
+					}, nil
+				},
+			}
+			a := Acme{
+				resourceNamespace: func(iss cmapi.GenericIssuer) string {
+					return iss.GetNamespace()
+				},
+				secretsClient:   secretsClient,
+				accountRegistry: accountRegistry,
+				keyFromSecret:   keyFromSecretMockBuilder(new(bool), rsaPrivKey, nil),
+				clientBuilder:   clientBuilderMock(cl),
+				recorder:        new(controllertest.FakeRecorder),
+			}
+
+			if err := a.Setup(t.Context(), issuer); err != nil {
+				t.Fatalf("Setup() returned an error: %v", err)
+			}
+			if gotAccount == nil || gotAccount.ExternalAccountBinding == nil {
+				t.Fatal("expected an account with an external account binding")
+			}
+			if got := gotAccount.ExternalAccountBinding.KID; got != fixture.keyID {
+				t.Errorf("expected KID %q, got %q", fixture.keyID, got)
+			}
+			if got := string(gotAccount.ExternalAccountBinding.Key); got != fixture.key {
+				t.Errorf("expected EAB key %q, got %q", fixture.key, got)
+			}
+			if got := issuer.GetStatus().ACMEStatus().URI; got != "https://acme.example.com/account/"+fixture.keyID {
+				t.Errorf("expected each issuer to keep its own account URI, got %q", got)
+			}
+		})
+	}
+
+	for _, fixture := range fixtures {
+		uid := fixture.name + "-uid"
+		if _, ok := registeredUIDs[uid]; !ok {
+			t.Errorf("expected account registry entry for issuer UID %q", uid)
+		}
+	}
+	if len(registeredUIDs) != len(fixtures) {
+		t.Errorf("expected %d independently registered clients, got %d", len(fixtures), len(registeredUIDs))
 	}
 }
 

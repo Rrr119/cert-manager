@@ -56,6 +56,14 @@ func TestIssuersForSecret_ACMEDNS01Solver(t *testing.T) {
 		gen.SetIssuerNamespace(ns),
 		gen.SetIssuerACMEEAB("kid", "eab-creds"),
 	)
+	secondEABIssuer := gen.Issuer("second-eab-issuer",
+		gen.SetIssuerNamespace(ns),
+		gen.SetIssuerACMEEAB("second-kid", "second-eab-creds"),
+	)
+	thirdEABIssuer := gen.Issuer("third-eab-issuer",
+		gen.SetIssuerNamespace(ns),
+		gen.SetIssuerACMEEAB("third-kid", "third-eab-creds"),
+	)
 	privateKeyIssuer := gen.Issuer("privatekey-issuer",
 		gen.SetIssuerNamespace(ns),
 		gen.SetIssuerACMEPrivKeyRef("privatekey-creds"),
@@ -79,7 +87,15 @@ func TestIssuersForSecret_ACMEDNS01Solver(t *testing.T) {
 	)
 
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	for _, iss := range []*v1.Issuer{route53Issuer, eabIssuer, privateKeyIssuer, caIssuer, otherNamespaceIssuer} {
+	for _, iss := range []*v1.Issuer{
+		route53Issuer,
+		eabIssuer,
+		secondEABIssuer,
+		thirdEABIssuer,
+		privateKeyIssuer,
+		caIssuer,
+		otherNamespaceIssuer,
+	} {
 		require.NoError(t, indexer.Add(iss))
 	}
 
@@ -96,6 +112,14 @@ func TestIssuersForSecret_ACMEDNS01Solver(t *testing.T) {
 		"a Secret referenced by ExternalAccountBinding still requeues its Issuer": {
 			secret:        secretNamed(ns, "eab-creds"),
 			expectIssuers: []string{"eab-issuer"},
+		},
+		"each EAB Secret requeues only the Issuer bound to it": {
+			secret:        secretNamed(ns, "second-eab-creds"),
+			expectIssuers: []string{"second-eab-issuer"},
+		},
+		"the third EAB Secret requeues only its Issuer": {
+			secret:        secretNamed(ns, "third-eab-creds"),
+			expectIssuers: []string{"third-eab-issuer"},
 		},
 		"a Secret referenced by the ACME PrivateKey still requeues its Issuer": {
 			secret:        secretNamed(ns, "privatekey-creds"),
